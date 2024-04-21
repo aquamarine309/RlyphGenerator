@@ -1,0 +1,469 @@
+import { ADNotations } from "../../../modules/notations.js";
+
+import { DEV } from "../../env.js";
+import { devMigrations } from "./dev-migrations.js";
+import { migrations } from "./migrations.js";
+
+import { deepmergeAll } from "../../utility/deepmerge.js";
+
+export const BACKUP_SLOT_TYPE = {
+  ONLINE: 0,
+  OFFLINE: 1,
+  RESERVE: 2,
+};
+
+// Note: interval is in seconds, and only the first RESERVE slot is ever used. Having intervalStr as a redundant
+// prop is necessary because using our TimeSpan formatting functions produces undesirable strings like "1.00 minutes"
+export const AutoBackupSlots = [
+  {
+    id: 1,
+    type: BACKUP_SLOT_TYPE.ONLINE,
+    intervalStr: () => `${formatInt(1)} minute`,
+    interval: 60,
+  },
+  {
+    id: 2,
+    type: BACKUP_SLOT_TYPE.ONLINE,
+    intervalStr: () => `${formatInt(5)} minutes`,
+    interval: 5 * 60,
+  },
+  {
+    id: 3,
+    type: BACKUP_SLOT_TYPE.ONLINE,
+    intervalStr: () => `${formatInt(20)} minutes`,
+    interval: 20 * 60,
+  },
+  {
+    id: 4,
+    type: BACKUP_SLOT_TYPE.ONLINE,
+    intervalStr: () => `${formatInt(1)} hour`,
+    interval: 3600,
+  },
+  {
+    id: 5,
+    type: BACKUP_SLOT_TYPE.OFFLINE,
+    intervalStr: () => `${formatInt(10)} minutes`,
+    interval: 10 * 60,
+  },
+  {
+    id: 6,
+    type: BACKUP_SLOT_TYPE.OFFLINE,
+    intervalStr: () => `${formatInt(1)} hour`,
+    interval: 3600,
+  },
+  {
+    id: 7,
+    type: BACKUP_SLOT_TYPE.OFFLINE,
+    intervalStr: () => `${formatInt(5)} hours`,
+    interval: 5 * 3600,
+  },
+  {
+    id: 8,
+    type: BACKUP_SLOT_TYPE.RESERVE,
+  },
+];
+
+export const GameStorage = {
+  currentSlot: 0,
+  saves: {
+    0: undefined,
+    1: undefined,
+    2: undefined
+  },
+  saved: 0,
+  lastSaveTime: Date.now(),
+  lastCloudSave: Date.now(),
+  offlineEnabled: undefined,
+  offlineTicks: undefined,
+  lastUpdateOnLoad: 0,
+  lastBackupTimes: [],
+  oldBackupTimer: 0,
+  ignoreBackupTimer: true,
+
+  // Limit offline tick count using two conditions:
+  // - Ticks should never be shorter than 33ms (this would allow offline to exploit tick microstructure)
+  // - Count should be limited to 1e6 (the options UI doesn't allow for this to be set above this value)
+  maxOfflineTicks(simulatedMs, defaultTicks = this.offlineTicks) {
+    const tickLimit = Math.clampMax(Math.floor(simulatedMs / 33), 1e6);
+    return Math.clampMax(defaultTicks, tickLimit);
+  },
+
+  get localStorageKey() {
+    return DEV ? "dimensionTestSave" : "dimensionSave";
+  },
+
+  backupDataKey(saveSlot, backupSlot) {
+    return DEV ? `backupTestSave-${saveSlot}-${backupSlot}` : `backupSave-${saveSlot}-${backupSlot}`;
+  },
+
+  backupTimeKey(saveSlot) {
+    return DEV ? `backupTestTimes-${saveSlot}` : `backupTimes-${saveSlot}`;
+  },
+
+  load() {
+    const save = localStorage.getItem(this.localStorageKey);
+    const root = GameSaveSerializer.deserialize(save);
+
+    this.loadRoot(root);
+    Achievements.updateSteamStatus();
+  },
+
+  loadRoot(root) {
+    if (root === undefined) {
+      this.currentSlot = 0;
+      this.loadPlayerObject(Player.defaultStart);
+      return;
+    }
+
+    if (root.saves === undefined) {
+      // Migrate old format
+      this.saves = {
+        0: root,
+        1: undefined,
+        2: undefined
+      };
+      this.currentSlot = 0;
+      this.loadPlayerObject(root);
+      this.loadBackupTimes();
+      this.backupOfflineSlots();
+      this.save(true);
+      return;
+    }
+
+    this.saves = root.saves;
+    this.currentSlot = root.current;
+    this.loadPlayerObject(this.saves[this.currentSlot]);
+    this.loadBackupTimes();
+    this.backupOfflineSlots();
+  },
+
+  loadSlot(slot) {
+    this.currentSlot = slot;
+    // Save current slot to make sure no changes are lost
+    this.save(true);
+    this.loadPlayerObject(this.saves[slot] ?? Player.defaultStart);
+    this.loadBackupTimes();
+    this.backupOfflineSlots();
+    Tabs.all.find(t => t.id === player.options.lastOpenTab).show(false);
+    Modal.hideAll();
+    Cloud.resetTempState();
+    Achievements.updateSteamStatus();
+  },
+
+  import(saveData) {
+    const newPlayer = GameSaveSerializer.deserialize(saveData);
+    if (this.checkPlayerObject(newPlayer) !== "") {
+      Modal.message.show("Could not load the save (format unrecognized or invalid).");
+      return;
+    }
+    this.oldBackupTimer = player.backupTimer;
+    Modal.hideAll();
+    this.loadPlayerObject(newPlayer);
+    GlyphAppearanceHandler.clearInvalidCosmetics();
+    this.save(true);
+    this.resetBackupTimer();
+
+    // This is to fix a very specific exploit: When the game is ending, some tabs get hidden
+    // The options tab is the first one of those, which makes the player redirect to the Pelle tab
+    // You can doom your reality even if you haven't unlocked infinity yet if you import while the Pelle tab
+    // is showing
+    Achievements.updateSteamStatus();
+  },
+
+  importAsFile() {
+    const reader = new FileReader();
+    const text = reader.readAsText(file);
+    this.import(text);
+  },
+
+  overwriteSlot(slot, saveData) {
+    this.saves[slot] = saveData;
+    if (slot === this.currentSlot) {
+      this.loadPlayerObject(saveData);
+    }
+
+    this.save(true);
+  },
+
+  // Some minimal save verification; if the save is valid then this returns an empty string, otherwise it returns a
+  // a string roughly stating what's wrong with the save. In order for importing to work properly, this must return
+  // an empty string.
+  checkPlayerObject(save) {
+    // Sometimes save is the output of GameSaveSerializer.deserialize, and if that function fails then it will result
+    // in the input parameter here being undefined
+    if (save === undefined || save === null) return "Save decoding failed (invalid format)";
+    // Right now all we do is check for the existence of an antimatter prop, but if we wanted to do further save
+    // verification then here's where we'd do it
+    if (save.money === undefined && save.antimatter === undefined) return "Save does not have antimatter property";
+
+    // Recursively check for any NaN props and add any we find to an array
+    const invalidProps = [];
+    function checkNaN(obj, path) {
+      let hasNaN = false;
+      for (const key in obj) {
+        const prop = obj[key];
+        let thisNaN;
+        switch (typeof prop) {
+          case "object":
+            thisNaN = checkNaN(prop, `${path}.${key}`);
+            hasNaN = hasNaN || thisNaN;
+            break;
+          case "number":
+            thisNaN = Number.isNaN(prop);
+            hasNaN = hasNaN || thisNaN;
+            if (thisNaN) invalidProps.push(`${path}.${key}`);
+            break;
+          case "string":
+            // If we're attempting to import, all NaN entries will still be strings
+            thisNaN = prop === "NaN";
+            hasNaN = hasNaN || thisNaN;
+            if (thisNaN) invalidProps.push(`${path}.${key}`);
+            break;
+        }
+      }
+      return hasNaN;
+    }
+    checkNaN(save, "player");
+
+    if (invalidProps.length === 0) return "";
+    return `${quantify("NaN player property", invalidProps.length)} found:
+      ${invalidProps.join(", ")}`;
+  },
+
+  // A few things in the current game state can prevent saving, which we want to do for all forms of saving
+  canSave(ignoreSimulation = false) {
+    return true;
+  },
+
+  save(silent = true, manual = false) {
+    if (!this.canSave()) return;
+    this.lastSaveTime = Date.now();
+    const root = {
+      current: this.currentSlot,
+      saves: this.saves
+    };
+    localStorage.setItem(this.localStorageKey, GameSaveSerializer.serialize(root));
+  },
+
+  // Saves a backup, updates save timers (this is called before nextBackup is updated), and then saves the timers too.
+  // When checking offline backups, this call typically resolves during offline progress simulation, so in this case
+  // we want to ignore that (which saves the game state pre-simulation). This is because it's messier and less useful
+  // to the player if we instead defer the call until after simulation
+  saveToBackup(backupSlot, backupTimer) {
+    if (!this.canSave(true)) return;
+    localStorage.setItem(this.backupDataKey(this.currentSlot, backupSlot), GameSaveSerializer.serialize(player));
+    this.lastBackupTimes[backupSlot] = {
+      backupTimer,
+      date: Date.now(),
+    };
+    localStorage.setItem(this.backupTimeKey(this.currentSlot), GameSaveSerializer.serialize(this.lastBackupTimes));
+  },
+
+  // Does not actually load, but returns an object which is meant to be passed on to loadPlayerObject()
+  loadFromBackup(backupSlot) {
+    const data = localStorage.getItem(this.backupDataKey(this.currentSlot, backupSlot));
+    return GameSaveSerializer.deserialize(data);
+  },
+
+  // Check for the amount of time spent offline and perform an immediate backup for the longest applicable slot
+  // which has had more than its timer elapse since the last time the game was open and saved
+  backupOfflineSlots() {
+    const currentTime = Date.now();
+    const offlineTimeMs = currentTime - this.lastUpdateOnLoad;
+    const offlineSlots = AutoBackupSlots
+      .filter(slot => slot.type === BACKUP_SLOT_TYPE.OFFLINE)
+      .sort((a, b) => b.interval - a.interval);
+    for (const backupInfo of offlineSlots) {
+      if (offlineTimeMs > 1000 * backupInfo.interval) {
+        this.saveToBackup(backupInfo.id, player.backupTimer);
+        break;
+      }
+    }
+  },
+
+  backupOnlineSlots(slotsToBackup) {
+    const currentTime = player.backupTimer;
+    for (const slot of slotsToBackup) this.saveToBackup(slot, currentTime);
+  },
+
+  // Loads in all the data from previous backup times in localStorage
+  loadBackupTimes() {
+    this.lastBackupTimes = GameSaveSerializer.deserialize(localStorage.getItem(this.backupTimeKey(this.currentSlot)));
+    if (!this.lastBackupTimes) this.lastBackupTimes = {};
+    for (const backupInfo of AutoBackupSlots) {
+      const key = backupInfo.id;
+      if (!this.lastBackupTimes[key]) {
+        this.lastBackupTimes[key] = {
+          backupTimer: 0,
+          date: 0,
+        };
+      }
+    }
+  },
+
+  // This is checked in the checkEverySecond game interval. Determining which slots to save has a 800ms grace time to
+  // account for delays occurring from the saving operation itself; without this, the timer slips backwards by a second
+  // every time it saves
+  tryOnlineBackups() {
+    const toBackup = [];
+    for (const backupInfo of AutoBackupSlots.filter(slot => slot.type === BACKUP_SLOT_TYPE.ONLINE)) {
+      const id = backupInfo.id;
+      const timeSinceLast = player.backupTimer - (this.lastBackupTimes[id]?.backupTimer ?? 0);
+      if (1000 * backupInfo.interval - timeSinceLast <= 800) toBackup.push(id);
+    }
+    this.backupOnlineSlots(toBackup);
+  },
+
+  // Set the next backup time, but make sure to skip forward an appropriate amount if a load or import happened,
+  // since these may cause the backup timer to be significantly behind
+  resetBackupTimer() {
+    const latestBackupTime = Object.values(this.lastBackupTimes).map(t => t && t.backupTimer).max();
+    player.backupTimer = Math.max(this.oldBackupTimer, player.backupTimer, latestBackupTime);
+  },
+
+  // Saves the current game state to the first reserve slot it finds
+  saveToReserveSlot() {
+    const targetSlot = AutoBackupSlots.find(slot => slot.type === BACKUP_SLOT_TYPE.RESERVE).id;
+    this.saveToBackup(targetSlot, player.backupTimer);
+  },
+
+  export() {
+    copyToClipboard(this.exportModifiedSave());
+  },
+
+  get exportDateString() {
+    const dateObj = new Date();
+    const y = dateObj.getFullYear();
+    const m = dateObj.getMonth() + 1;
+    const d = dateObj.getDate();
+    return `${y}-${m}-${d}`;
+  },
+
+  exportAsFile() {
+    if (!this.canSave()) return;
+    player.options.exportedFileCount++;
+    this.save(true);
+    const saveFileName = player.options.saveFileName ? ` - ${player.options.saveFileName},` : "";
+    const save = this.exportModifiedSave();
+    download(
+      `AD Save, Slot ${GameStorage.currentSlot + 1}${saveFileName} #${player.options.exportedFileCount} \
+(${this.exportDateString}).txt`, save);
+  },
+
+  exportBackupsAsFile() {
+    player.options.exportedFileCount++;
+    const backupData = {};
+    for (const id of AutoBackupSlots.map(slot => slot.id)) {
+      const backup = this.loadFromBackup(id);
+      if (backup) backupData[id] = backup;
+    }
+    backupData.time = GameSaveSerializer.deserialize(localStorage.getItem(this.backupTimeKey(this.currentSlot)));
+    download(
+      `AD Save Backups, Slot ${GameStorage.currentSlot + 1} #${player.options.exportedFileCount} \
+(${this.exportDateString}).txt`, GameSaveSerializer.serialize(backupData));
+  },
+
+  importBackupsFromFile(importText) {
+    const backupData = GameSaveSerializer.deserialize(importText);
+    localStorage.setItem(this.backupTimeKey(this.currentSlot), GameSaveSerializer.serialize(backupData.time));
+    for (const backupKey of Object.keys(backupData)) {
+      if (backupKey === "time") continue;
+      const id = Number(backupKey);
+      const storageKey = this.backupDataKey(this.currentSlot, id);
+      localStorage.setItem(storageKey, GameSaveSerializer.serialize(backupData[backupKey]));
+      this.backupTimeData[id] = {
+        backupTimer: backupData.time[id].backupTimer,
+        date: backupData.time[id].date,
+      };
+    }
+    this.resetBackupTimer();
+  },
+
+  // There are a couple props which may need to export with different values, so we handle that here
+  exportModifiedSave() {
+
+    // Serialize the altered data, then restore the old prop values afterwards and return
+    const save = GameSaveSerializer.serialize(player);
+    return save;
+  },
+
+  hardReset() {
+    this.loadPlayerObject(Player.defaultStart);
+    this.save(true);
+  },
+
+  loadPlayerObject(playerObject) {
+    this.saved = 0;
+
+    const checkString = this.checkPlayerObject(playerObject);
+    if (playerObject === Player.defaultStart || checkString !== "") {
+      if (DEV && checkString !== "") {
+        // eslint-disable-next-line no-console
+        console.log(`Savefile was invalid and has been reset - ${checkString}`);
+      }
+      player = deepmergeAll([{}, Player.defaultStart]);
+      player.records.gameCreatedTime = Date.now();
+      player.lastUpdate = Date.now();
+      if (DEV) {
+        devMigrations.setLatestTestVersion(player);
+      }
+    } else {
+      // We want to support importing from versions much older than the newest pre-reality version, but we also want
+      // to support in-dev versions so we don't lose access to the large bank of in-dev saves we've accumulated. As
+      // a result, we need to be careful with what order we apply the dev/live migrations and the deepmerge with the
+      // default player object to fill in missing props.
+
+      // For pre-Reality versions, we additionally need to fire off an event to ensure certain achievements and
+      // notifications trigger properly. Missing props are filled in at this step via deepmerge
+      const isPreviousVersionSave = playerObject.version < migrations.firstRealityMigration;
+      player = migrations.patchPreReality(playerObject);
+      if (isPreviousVersionSave) {
+        if (DEV) devMigrations.setLatestTestVersion(player);
+        EventHub.dispatch(GAME_EVENT.SAVE_CONVERTED_FROM_PREVIOUS_VERSION);
+      }
+
+      // All dev migrations are applied in-place, mutating the player object. Note that since we only want to apply dev
+      // migrations in a dev environment, this means that test saves may fail to migrate on the live version
+      if (DEV && player.options.testVersion !== undefined) {
+        devMigrations.patch(player);
+      }
+
+      // Post-reality migrations are separated from pre-reality because they need to happen after any dev migrations,
+      // which themselves must happen after the deepmerge
+      player = migrations.patchPostReality(player);
+    }
+    recalculateAllGlyphs();
+    Theme.set(Theme.currentName());
+    Glyphs.unseen = [];
+    Glyphs.unequipped = [];
+    ADNotations.Settings.exponentCommas.min = 10 ** player.options.notationDigits.comma;
+    ADNotations.Settings.exponentCommas.max = 10 ** player.options.notationDigits.notation;
+
+    EventHub.dispatch(GAME_EVENT.GAME_LOAD);
+    //AutomatorBackend.initializeFromSave();
+    Lazy.invalidateAll();
+      // This is ugly, should fix how we deal with it...
+    this.postLoadStuff();
+  },
+  postLoadStuff() {
+    GameUI.update();
+
+    for (const resource of AlchemyResources.all) {
+      resource.before = resource.amount;
+    }
+  }
+};
+
+function download(filename, text) {
+  const pom = document.createElement("a");
+  pom.setAttribute("href", `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`);
+  pom.setAttribute("download", filename);
+
+  if (document.createEvent) {
+    const event = document.createEvent("MouseEvents");
+    event.initEvent("click", true, true);
+    pom.dispatchEvent(event);
+  } else {
+    pom.click();
+  }
+}
